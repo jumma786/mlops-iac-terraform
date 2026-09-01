@@ -1,0 +1,23 @@
+# Copy to terraform.tfvars and adjust. terraform.tfvars is gitignored.
+
+project     = "mlopsapi"
+environment = "dev"
+location    = "uksouth"
+
+image_name = "readmission-api"
+image_tag  = "latest" # pin an explicit tag or digest in prod
+
+container_port = 8000
+
+# Supported cpu/memory pairs: 0.25/0.5Gi, 0.5/1Gi, 0.75/1.5Gi, 1.0/2Gi, ...
+cpu    = 0.5
+memory = "1Gi"
+
+min_replicas = 0 # 0 = scale to zero (no idle cost, cold starts). Use 1 if p99 matters.
+max_replicas = 3
+
+tags = {
+  managed_by = "terraform"
+  workload   = "ml-model-serving"
+  owner      = "jumma"
+}
