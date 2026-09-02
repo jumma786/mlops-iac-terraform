@@ -1,0 +1,16 @@
+# Copy to backend.hcl and fill in, then:
+#
+#   terraform init -backend-config=backend.hcl
+#
+# backend.hcl is gitignored. The storage account has to exist first - see the
+# "Remote state" section of the README for the three az commands that create it.
+#
+# Authentication is Azure AD (use_azuread_auth is set in providers.tf), not a
+# storage key, so your principal needs the "Storage Blob Data Contributor" role
+# on the container. Subscription Owner alone is not enough: Azure Storage keeps
+# data-plane access separate from management-plane access.
+
+resource_group_name  = "rg-tfstate"
+storage_account_name = "sttfstate<unique>"
+container_name       = "tfstate"
+key                  = "mlops-iac.tfstate"
