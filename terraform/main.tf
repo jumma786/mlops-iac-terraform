@@ -4,6 +4,18 @@ locals {
   name_prefix = "${var.project}-${var.environment}"
   acr_name    = "acr${var.project}${var.environment}${random_string.suffix.result}"
 
+  # Bootstrap mode. On the first apply the registry exists but is empty, so
+  # pointing the app at <acr>/<image>:<tag> would create a revision that can never
+  # pull. Until image_tag is set the app runs a public placeholder instead, which
+  # keeps the first apply green. Push an image, set image_tag, apply again.
+  bootstrap = var.image_tag == null
+
+  container_image = local.bootstrap ? var.bootstrap_image : "${azurerm_container_registry.this.login_server}/${var.image_name}:${var.image_tag}"
+
+  # The placeholder serves plain HTTP on its own port and has no /health, so
+  # ingress and the probes follow whichever image is actually running.
+  app_port = local.bootstrap ? var.bootstrap_port : var.container_port
+
   tags = merge(var.tags, {
     environment = var.environment
     project     = var.project
@@ -68,7 +80,11 @@ resource "azurerm_log_analytics_workspace" "this" {
   location            = azurerm_resource_group.this.location
   sku                 = "PerGB2018"
   retention_in_days   = var.log_retention_days
-  tags                = local.tags
+
+  # Cost guardrail: a chatty container can otherwise bill unbounded ingestion.
+  daily_quota_gb = var.log_daily_quota_gb
+
+  tags = local.tags
 }
 
 # ---------------------------------------------------------------------------
@@ -106,13 +122,13 @@ resource "azurerm_container_app" "api" {
 
     container {
       name   = var.image_name
-      image  = "${azurerm_container_registry.this.login_server}/${var.image_name}:${var.image_tag}"
+      image  = local.container_image
       cpu    = var.cpu
       memory = var.memory
 
       env {
         name  = "PORT"
-        value = tostring(var.container_port)
+        value = tostring(local.app_port)
       }
 
       env {
@@ -120,27 +136,40 @@ resource "azurerm_container_app" "api" {
         value = var.environment
       }
 
+      # Probes are skipped in bootstrap mode: the placeholder has no /health, so
+      # probing it would fail a revision that is doing exactly what it should.
+      #
       # Kills a replica that has stopped serving rather than leaving it in
       # rotation returning errors - the failure mode monitoring is meant to catch.
-      liveness_probe {
-        transport = "HTTP"
-        port      = var.container_port
-        path      = "/health"
+      dynamic "liveness_probe" {
+        for_each = local.bootstrap ? [] : [1]
 
-        initial_delay           = 10
-        interval_seconds        = 30
-        failure_count_threshold = 3
+        content {
+          transport = "HTTP"
+          port      = var.container_port
+          path      = "/health"
+
+          initial_delay           = 10
+          interval_seconds        = 30
+          timeout                 = 5
+          failure_count_threshold = 3
+        }
       }
 
       # Holds traffic back until the model has finished loading into memory.
-      readiness_probe {
-        transport = "HTTP"
-        port      = var.container_port
-        path      = "/health"
+      dynamic "readiness_probe" {
+        for_each = local.bootstrap ? [] : [1]
 
-        interval_seconds        = 10
-        failure_count_threshold = 3
-        success_count_threshold = 1
+        content {
+          transport = "HTTP"
+          port      = var.container_port
+          path      = "/health"
+
+          interval_seconds        = 10
+          timeout                 = 5
+          failure_count_threshold = 3
+          success_count_threshold = 1
+        }
       }
     }
 
@@ -153,7 +182,7 @@ resource "azurerm_container_app" "api" {
 
   ingress {
     external_enabled = true
-    target_port      = var.container_port
+    target_port      = local.app_port
     transport        = "auto"
 
     traffic_weight {

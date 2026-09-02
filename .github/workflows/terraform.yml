@@ -8,10 +8,25 @@ on:
     paths: ["terraform/**", ".github/workflows/terraform.yml"]
   workflow_dispatch:
 
+# Least privilege by default; the jobs that need more widen it themselves.
 permissions:
   contents: read
-  id-token: write        # OIDC federated login to Azure - no long-lived secrets
-  pull-requests: write   # so the plan can be posted back onto the PR
+
+# Serialise runs against the same ref. Two merges landing together would
+# otherwise apply concurrently and fight over the state lock.
+concurrency:
+  group: terraform-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TF_VERSION: "1.9.8"
+
+  # OIDC federated login - no client secret is stored. Set on the job env rather
+  # than per step so `terraform init` can authenticate to the state container too.
+  ARM_USE_OIDC: true
+  ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
 defaults:
   run:
@@ -19,29 +34,63 @@ defaults:
 
 jobs:
   validate:
-    name: fmt + validate
+    name: fmt + validate + lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: 1.9.8
+          terraform_version: ${{ env.TF_VERSION }}
 
       - name: terraform fmt
         run: terraform fmt -check -recursive
 
-      # No backend here: validate must not need cloud credentials.
+      # No backend here: validate must not need cloud credentials, so it also
+      # passes on forks.
       - name: terraform init (no backend)
         run: terraform init -backend=false
 
       - name: terraform validate
         run: terraform validate
 
+      - uses: terraform-linters/setup-tflint@v6
+        with:
+          tflint_version: v0.64.0
+
+      # Catches what `validate` cannot: unused variables, undocumented outputs,
+      # and provider values the Azure API would only reject at apply time.
+      - name: tflint
+        run: |
+          tflint --init
+          tflint --format compact
+
+      # Reported for visibility; does not block.
+      - name: trivy (report)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: config
+          scan-ref: terraform
+          severity: HIGH,CRITICAL
+          exit-code: 0
+
+      # Blocks on CRITICAL only. Tighten to HIGH once the backlog is clear.
+      - name: trivy (gate)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: config
+          scan-ref: terraform
+          severity: CRITICAL
+          exit-code: 1
+
   plan:
     name: plan
     needs: validate
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write        # OIDC federated login to Azure
+      pull-requests: write   # so the plan can be posted back onto the PR
     # Skip on forks, which cannot access OIDC credentials.
     if: github.event.pull_request.head.repo.full_name == github.repository || github.event_name != 'pull_request'
     steps:
@@ -49,7 +98,7 @@ jobs:
 
       - uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: 1.9.8
+          terraform_version: ${{ env.TF_VERSION }}
 
       - uses: azure/login@v2
         with:
@@ -58,16 +107,27 @@ jobs:
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: terraform init
-        run: terraform init
+        run: |
+          terraform init -input=false \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TFSTATE_CONTAINER }}" \
+            -backend-config="key=mlops-iac.tfstate"
 
       - name: terraform plan
         id: plan
-        run: terraform plan -no-color -input=false -out=tfplan
-        env:
-          ARM_USE_OIDC: true
-          ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: terraform plan -no-color -input=false -lock-timeout=5m -out=tfplan
+
+      # The apply job runs this exact file rather than re-planning, so what a
+      # reviewer approves is what lands. Retention is short because a plan file
+      # embeds resource attributes and is readable by anyone with repo access.
+      - name: upload plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ github.sha }}
+          path: terraform/tfplan
+          retention-days: 1
+          if-no-files-found: error
 
       - name: comment plan on PR
         if: github.event_name == 'pull_request'
@@ -76,7 +136,11 @@ jobs:
           PLAN: ${{ steps.plan.outputs.stdout }}
         with:
           script: |
-            const plan = (process.env.PLAN || '').slice(0, 60000);
+            const limit = 60000;
+            const full = process.env.PLAN || '';
+            const plan = full.length > limit
+              ? full.slice(0, limit) + `\n\n[truncated: ${full.length - limit} more characters - see the "plan" job log for the full output]`
+              : full;
             await github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
@@ -89,6 +153,9 @@ jobs:
     needs: plan
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     # Requires a reviewer to approve in GitHub before infrastructure changes land.
     environment: production
     steps:
@@ -96,7 +163,7 @@ jobs:
 
       - uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: 1.9.8
+          terraform_version: ${{ env.TF_VERSION }}
 
       - uses: azure/login@v2
         with:
@@ -105,12 +172,21 @@ jobs:
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: terraform init
-        run: terraform init
+        run: |
+          terraform init -input=false \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TFSTATE_CONTAINER }}" \
+            -backend-config="key=mlops-iac.tfstate"
 
+      - name: download approved plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ github.sha }}
+          path: terraform
+
+      # Applies the reviewed plan, not a fresh one. If state moved while the
+      # approval was pending, Terraform rejects the stale plan rather than
+      # applying something nobody looked at.
       - name: terraform apply
-        run: terraform apply -auto-approve -input=false
-        env:
-          ARM_USE_OIDC: true
-          ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: terraform apply -input=false -lock-timeout=5m tfplan

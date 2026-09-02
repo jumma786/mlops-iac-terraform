@@ -5,16 +5,28 @@ environment = "dev"
 location    = "uksouth"
 
 image_name = "readmission-api"
-image_tag  = "latest" # pin an explicit tag or digest in prod
+
+# Leave image_tag unset (null) on the very first apply - the registry is empty at
+# that point, so the app runs a public placeholder and the apply still goes green.
+# Push an image, then pin an immutable tag here and apply again. A mutable tag such
+# as "latest" is rejected: it produces no plan diff, so it would never deploy.
+#
+# image_tag = "a1b2c3d"                                             # build SHA
+# image_tag = "sha256:6f8e...  "                                    # or a digest
 
 container_port = 8000
 
-# Supported cpu/memory pairs: 0.25/0.5Gi, 0.5/1Gi, 0.75/1.5Gi, 1.0/2Gi, ...
+# cpu/memory must be a supported pair - memory is always 2Gi per vCPU:
+# 0.25/0.5Gi, 0.5/1Gi, 0.75/1.5Gi, 1/2Gi, 1.25/2.5Gi, 1.5/3Gi, 1.75/3.5Gi, 2/4Gi
 cpu    = 0.5
 memory = "1Gi"
 
 min_replicas = 0 # 0 = scale to zero (no idle cost, cold starts). Use 1 if p99 matters.
 max_replicas = 3
+
+# Ingestion cap, in GB/day. -1 removes it.
+log_daily_quota_gb = 1
+log_retention_days = 30
 
 tags = {
   managed_by = "terraform"

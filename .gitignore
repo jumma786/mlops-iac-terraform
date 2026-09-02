@@ -16,6 +16,14 @@ terraform.rc
 tfplan
 *.tfplan
 
+# Backend configuration - contains the state storage account, not secrets, but is
+# environment-specific. Commit backend.hcl.example instead.
+backend.hcl
+
+# Tooling
+.tflint.d/
+.claude/
+
 # Editors / OS
 .vscode/
 .idea/
