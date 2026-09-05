@@ -15,6 +15,8 @@ provisioned by Terraform, reviewed as a plan on every pull request, applied behi
 
 </div>
 
+**Related:** [Portfolio entry](https://jumma786.github.io/portfolio/#projects) · [Medium case study](https://medium.com/@jummamohammad477/infrastructure-as-code-583bd28b92bf)
+
 ---
 
 |  |  |
